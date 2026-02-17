@@ -1,0 +1,11 @@
+﻿model;ihlal_turu;baslangic_saniyesi;bitis_saniyesi;toplam_sure_saniye
+YOLO11n (nano);Goz Kapali;33,80;41,00;7,20
+YOLO11n (nano);Hareketsizlik;13,40;41,33;27,93
+YOLO11n (nano);Hareketsizlik;69,60;74,93;5,33
+YOLO11s (small);Goz Kapali;33,80;41,00;7,20
+YOLO11s (small);Hareketsizlik;21,90;41,30;19,40
+YOLO11s (small);Hareketsizlik;69,60;73,89;4,30
+
+model;ortalama_fps
+YOLO11n (nano);51,20
+YOLO11s (small);48,99
