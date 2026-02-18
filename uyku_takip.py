@@ -10,19 +10,16 @@ from typing import Dict, Tuple, List, Optional
 from ultralytics import YOLO
 import mediapipe as mp
 
+from utils.core_logic import (
+    CentroidTracker, PersonState, ViolationManager as BaseViolationManager,
+    eye_aspect_ratio, LEFT_EYE_IDX, RIGHT_EYE_IDX, NOSE_IDX
+)
+
 
 # ===========================================================
 # MODEL & GENEL AYARLAR
 # ===========================================================
-
-# Bu dosya: NVIDIA GPU + TensorRT ile optimize edilmiş
-# basit bir "Yapay Zeka Uyku ve Güvenlik Takip Sistemi" örneğidir.
-# - YOLOv11n (ultralytics) + TensorRT FP16 engine
-# - Kişi tespiti + basit takip (ID)
-# - 10 sn hareketsizlik ihlali
-# - 10 sn göz kapalılığı (EAR) ihlali
-# - İhlal anında ekran görüntüsü kaydı
-
+# ... (sabitler aynı kalıyor) ...
 PT_MODEL_PATH = "yolo11n.pt"          # YOLOv11n PyTorch ağırlık dosyası
 ENGINE_MODEL_PATH = "yolo11n.engine"  # TensorRT engine dosyası
 OUTPUT_DIR = "ihlal_kayitlari"        # İhlal kayıtlarının kaydedileceği klasör
@@ -40,246 +37,18 @@ SAVE_COOLDOWN_SECONDS = 1.0   # Aynı anda çok fazla kayıt almamak için minim
 
 
 # ===========================================================
-# BASİT ID TAKİPÇİ (Centroid Tracker)
+# ÖZEL İHLAL YÖNETİCİSİ (Webcam için Kaydetme Özellikli)
 # ===========================================================
 
-@dataclass
-class Track:
-    track_id: int
-    bbox: Tuple[int, int, int, int]  # (x1, y1, x2, y2)
-    last_update_time: float = field(default_factory=time.time)
-
-
-class CentroidTracker:
+class WebcamViolationManager(BaseViolationManager):
     """
-    Çok basit bir centroid tabanlı takip sınıfı.
-    - Her karede gelen bounding box'ları, bir önceki karedeki track'lere
-      merkez mesafesine göre eşler.
-    - Temel senaryolarda yeterlidir, üretim için daha gelişmiş takipçiler kullanılabilir.
+    Core ViolationManager'a ek olarak kare kaydetme cooldown kontrolü ekler.
     """
-
-    def __init__(self, max_distance: float = IOU_TRACK_THRESH, max_lost_time: float = 1.0):
-        self.next_id = 0
-        self.tracks: Dict[int, Track] = {}
-        self.max_distance = max_distance
-        self.max_lost_time = max_lost_time
-
-    @staticmethod
-    def _center_of_box(bbox: Tuple[int, int, int, int]) -> Tuple[float, float]:
-        x1, y1, x2, y2 = bbox
-        return (x1 + x2) / 2.0, (y1 + y2) / 2.0
-
-    def update(self, detections: List[Tuple[int, int, int, int]]) -> Dict[int, Tuple[int, int, int, int]]:
-        """
-        :param detections: Her biri (x1, y1, x2, y2) olan bounding box listesi
-        :return: track_id -> bbox sözlüğü
-        """
-        current_time = time.time()
-        assigned_tracks: Dict[int, Tuple[int, int, int, int]] = {}
-
-        # Eğer hiç tespit yoksa, sadece zaman aşımına uğrayan track'leri temizle.
-        if not detections:
-            self._cleanup(current_time)
-            return {tid: t.bbox for tid, t in self.tracks.items()}
-
-        # Mevcut track'lerin merkezlerini hazırla
-        track_ids = list(self.tracks.keys())
-        track_centers = [self._center_of_box(self.tracks[tid].bbox) for tid in track_ids]
-
-        used_detections = set()
-
-        # Her yeni bounding box için en uygun (en yakın) track'i bul
-        for det_idx, det_bbox in enumerate(detections):
-            det_center = self._center_of_box(det_bbox)
-            best_track_id = None
-            best_dist = float("inf")
-
-            for tid, t_center in zip(track_ids, track_centers):
-                # Aynı karede bir track'e iki kez atama yapma
-                if tid in assigned_tracks:
-                    continue
-                dist = math.dist(det_center, t_center)
-                if dist < best_dist and dist < self.max_distance:
-                    best_dist = dist
-                    best_track_id = tid
-
-            if best_track_id is not None:
-                # Mevcut track'i güncelle
-                self.tracks[best_track_id].bbox = det_bbox
-                self.tracks[best_track_id].last_update_time = current_time
-                assigned_tracks[best_track_id] = det_bbox
-                used_detections.add(det_idx)
-
-        # Eşleşmemiş tespitler için yeni track ID oluştur
-        for det_idx, det_bbox in enumerate(detections):
-            if det_idx in used_detections:
-                continue
-            new_id = self.next_id
-            self.next_id += 1
-            self.tracks[new_id] = Track(track_id=new_id, bbox=det_bbox, last_update_time=current_time)
-            assigned_tracks[new_id] = det_bbox
-
-        # Zaman aşımına uğramış track'leri sil
-        self._cleanup(current_time)
-
-        # Güncel track'leri döndür
-        return {tid: self.tracks[tid].bbox for tid in self.tracks.keys()}
-
-    def _cleanup(self, current_time: float):
-        """Uzun süre güncellenmeyen (kayıp) track'leri temizler."""
-        to_delete = []
-        for tid, t in self.tracks.items():
-            if current_time - t.last_update_time > self.max_lost_time:
-                to_delete.append(tid)
-        for tid in to_delete:
-            del self.tracks[tid]
-
-
-# ===========================================================
-# KİŞİ DURUM TAKİBİ (Hareketsizlik + Göz Kapalı)
-# ===========================================================
-
-@dataclass
-class PersonState:
-    """
-    Her bir kişi (track_id) için tutulacak durum bilgisi:
-    - ref_centroid: Hareketsizlik karşılaştırması için referans merkez
-    - still_start_time: Hareketsizlik süresinin başladığı zaman
-    - eye_closed_start_time: Göz kapalılığı süresinin başladığı zaman
-    - last_ear: Son ölçülen EAR değeri
-    """
-
-    track_id: int
-    ref_centroid: Tuple[float, float]
-    still_start_time: Optional[float] = None
-    eye_closed_start_time: Optional[float] = None
-    last_ear: float = 0.0
-    still_violation_active: bool = False
-    eye_violation_active: bool = False
-
-
-class ViolationManager:
-    """
-    Her kişi için:
-    - Hareketsizlik süresi
-    - Göz kapalılığı süresi
-    - EAR değeri
-    takibini yapar ve global ihlal durumunu hesaplar.
-    """
-
-    def __init__(self):
-        self.person_states: Dict[int, PersonState] = {}
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
         self.last_save_time: float = 0.0
 
-    @staticmethod
-    def _center_of_box(bbox: Tuple[int, int, int, int]) -> Tuple[float, float]:
-        x1, y1, x2, y2 = bbox
-        return (x1 + x2) / 2.0, (y1 + y2) / 2.0
-
-    def update_tracks(self, track_boxes: Dict[int, Tuple[int, int, int, int]]):
-        """
-        - Yeni track'ler için PersonState oluşturur.
-        - Mevcut track'ler için merkez bilgisiyle hareketsizlik durumunu günceller.
-        - Kaybolan track'leri siler.
-        """
-        existing_ids = set(self.person_states.keys())
-        current_ids = set(track_boxes.keys())
-
-        # Yeni gelen track'ler için başlangıç durumu oluştur
-        for tid in current_ids - existing_ids:
-            centroid = self._center_of_box(track_boxes[tid])
-            self.person_states[tid] = PersonState(track_id=tid, ref_centroid=centroid)
-
-        # Hareketsizlik için merkez hareketini takip et
-        current_time = time.time()
-        for tid in current_ids:
-            bbox = track_boxes[tid]
-            centroid = self._center_of_box(bbox)
-            state = self.person_states[tid]
-
-            dist = math.dist(centroid, state.ref_centroid)
-            if dist < MOVEMENT_PIXEL_THRESHOLD:
-                # Kişi yeterince sabit görünüyorsa süreyi başlat/koru
-                if state.still_start_time is None:
-                    state.still_start_time = current_time
-            else:
-                # Kişi hareket etti, referans noktayı ve süreyi sıfırla
-                state.ref_centroid = centroid
-                state.still_start_time = None
-                state.still_violation_active = False
-
-        # Artık görünmeyen track'leri temizle
-        for tid in existing_ids - current_ids:
-            del self.person_states[tid]
-
-    def update_eye_state(self, track_id: int, ear: float):
-        """
-        Göz açıklık oranını (EAR) günceller ve göz kapalılık süresini takip eder.
-        """
-        current_time = time.time()
-        if track_id not in self.person_states:
-            return
-
-        state = self.person_states[track_id]
-        state.last_ear = ear
-
-        if ear < EAR_THRESHOLD:
-            # Gözler kapalı kabul ediliyor
-            if state.eye_closed_start_time is None:
-                state.eye_closed_start_time = current_time
-        else:
-            # Gözler tekrar açıldı, süreyi ve ihlal durumunu sıfırla
-            state.eye_closed_start_time = None
-            state.eye_violation_active = False
-
-    def compute_violations(self) -> Tuple[bool, List[str], Dict[int, Dict[str, float]]]:
-        """
-        Tüm kişiler için ihlalleri hesaplar.
-
-        :return:
-            - global_violation: Herhangi bir ihlal var mı?
-            - reasons: Tespit edilen ihlal nedenleri (metin listesi)
-            - per_person_timers: {track_id: {"still": kalan_süre, "eye": kalan_süre, "ear": EAR}}
-        """
-        current_time = time.time()
-        global_violation = False
-        reasons = set()
-        per_person_timers: Dict[int, Dict[str, float]] = {}
-
-        for tid, state in self.person_states.items():
-            still_remaining = STILLNESS_SECONDS
-            eye_remaining = EYE_CLOSED_SECONDS
-
-            # Hareketsizlik ihlali
-            if state.still_start_time is not None:
-                elapsed_still = current_time - state.still_start_time
-                still_remaining = max(0.0, STILLNESS_SECONDS - elapsed_still)
-                if elapsed_still >= STILLNESS_SECONDS:
-                    global_violation = True
-                    state.still_violation_active = True
-                    reasons.add("Hareketsizlik")
-
-                # Goz kapalilik ihlali
-            if state.eye_closed_start_time is not None:
-                elapsed_eye = current_time - state.eye_closed_start_time
-                eye_remaining = max(0.0, EYE_CLOSED_SECONDS - elapsed_eye)
-                if elapsed_eye >= EYE_CLOSED_SECONDS:
-                    global_violation = True
-                    state.eye_violation_active = True
-                    reasons.add("Goz Kapali")
-
-            per_person_timers[tid] = {
-                "still": still_remaining,
-                "eye": eye_remaining,
-                "ear": state.last_ear,
-            }
-
-        return global_violation, sorted(list(reasons)), per_person_timers
-
     def should_save_frame(self) -> bool:
-        """
-        Çok sık kayıt alınmasını engellemek için basit bir cooldown kontrolü.
-        """
         current_time = time.time()
         if current_time - self.last_save_time >= SAVE_COOLDOWN_SECONDS:
             self.last_save_time = current_time
@@ -294,42 +63,11 @@ class ViolationManager:
 # Resmi MediaPipe paketinde FaceMesh'e bu şekilde erişilir
 mp_face_mesh = mp.solutions.face_mesh
 
-# MediaPipe FaceMesh (468 nokta) için tipik göz landmark index'leri
-LEFT_EYE_IDX = [33, 160, 158, 133, 153, 144]
-RIGHT_EYE_IDX = [362, 385, 387, 263, 373, 380]
-
-# Yüz konumu için burun çevresinden bir nokta (yaklaşık merkez)
-NOSE_IDX = 1
-
-
-def euclidean_distance(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
-    """İki nokta arasındaki Öklid uzaklığını hesaplar."""
-    return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
-
-
-def eye_aspect_ratio(eye_points: List[Tuple[float, float]]) -> float:
-    """
-    Eye Aspect Ratio (EAR) hesabı:
-        EAR = (||p2 - p6|| + ||p3 - p5||) / (2 * ||p1 - p4||)
-    6 noktalı göz çevresi koordinatları kullanılır.
-    """
-    if len(eye_points) != 6:
-        return 0.0
-    p1, p2, p3, p4, p5, p6 = eye_points
-    vertical_1 = euclidean_distance(p2, p6)
-    vertical_2 = euclidean_distance(p3, p5)
-    horizontal = euclidean_distance(p1, p4)
-    if horizontal == 0:
-        return 0.0
-    ear = (vertical_1 + vertical_2) / (2.0 * horizontal)
-    return ear
-
-
 def compute_ear_for_faces(
     frame: np.ndarray,
     face_landmarks_list,
     track_boxes: Dict[int, Tuple[int, int, int, int]],
-    violation_manager: ViolationManager,
+    violation_manager: WebcamViolationManager,
 ):
     """
     - MediaPipe FaceMesh çıktısını kullanarak her yüz için EAR hesaplar.
@@ -337,24 +75,25 @@ def compute_ear_for_faces(
     - Bulunan kişi için EAR değerini ViolationManager'a gönderir.
     """
     h, w, _ = frame.shape
+    current_time = time.time()
 
     for face_landmarks in face_landmarks_list:
-        # Landmark'ları piksel koordinatına çevir
         coords: List[Tuple[int, int]] = []
         for lm in face_landmarks.landmark:
             x_px = int(lm.x * w)
             y_px = int(lm.y * h)
             coords.append((x_px, y_px))
 
-        # Sol ve sağ göz noktalarını seç
         left_eye = [coords[i] for i in LEFT_EYE_IDX]
         right_eye = [coords[i] for i in RIGHT_EYE_IDX]
 
+        ear = eye_aspect_ratio(left_eye + right_eye) if len(left_eye+right_eye) == 12 else 0.0
+        # Not: core logic'teki eye_aspect_ratio 6 nokta bekliyor. 
+        # Burada her gözü ayrı hesaplayıp ortalamasını alalım.
         left_ear = eye_aspect_ratio(left_eye)
         right_ear = eye_aspect_ratio(right_eye)
         ear = (left_ear + right_ear) / 2.0
 
-        # Burun noktası ile hangi kişiye ait olduğunu bul (basit kutu içi kontrol)
         nose_x, nose_y = coords[NOSE_IDX]
         assigned_track_id = None
         for tid, bbox in track_boxes.items():
@@ -364,7 +103,7 @@ def compute_ear_for_faces(
                 break
 
         if assigned_track_id is not None:
-            violation_manager.update_eye_state(assigned_track_id, ear)
+            violation_manager.update_eye_state(assigned_track_id, ear, current_time)
 
 
 # ===========================================================
@@ -471,8 +210,13 @@ def main():
         print("[HATA] Kamera açılamadı.")
         return
 
-    tracker = CentroidTracker()
-    violation_manager = ViolationManager()
+    tracker = CentroidTracker(max_distance=IOU_TRACK_THRESH)
+    violation_manager = WebcamViolationManager(
+        still_threshold=STILLNESS_SECONDS,
+        eye_threshold=EYE_CLOSED_SECONDS,
+        movement_threshold=MOVEMENT_PIXEL_THRESHOLD,
+        ear_threshold=EAR_THRESHOLD
+    )
 
     # MediaPipe Face Mesh başlat
     face_mesh = mp_face_mesh.FaceMesh(

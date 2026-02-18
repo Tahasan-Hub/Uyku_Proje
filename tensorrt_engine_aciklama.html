@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>.pt → TensorRT .engine: Neden, Nasıl, Parametreler</title>
+    <style>
+      :root{
+        --bg:#0b1220;
+        --panel:#0f1a2e;
+        --text:#e7eefc;
+        --muted:#a7b5d6;
+        --accent:#7dd3fc;
+        --accent2:#a78bfa;
+        --border:rgba(231,238,252,.12);
+        --codebg:rgba(231,238,252,.06);
+      }
+      *{box-sizing:border-box}
+      body{
+        margin:0;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Noto Sans", "Helvetica Neue", sans-serif;
+        line-height:1.55;
+        background: radial-gradient(1200px 600px at 20% 0%, rgba(167,139,250,.18), transparent),
+                    radial-gradient(900px 500px at 80% 10%, rgba(125,211,252,.18), transparent),
+                    var(--bg);
+        color:var(--text);
+      }
+      a{color:var(--accent)}
+      .wrap{max-width:1100px;margin:0 auto;padding:28px 18px 64px}
+      header{
+        padding:18px 18px;
+        border:1px solid var(--border);
+        background: linear-gradient(180deg, rgba(125,211,252,.10), rgba(15,26,46,.65));
+        border-radius:16px;
+      }
+      header h1{margin:0 0 8px;font-size:22px;letter-spacing:.2px}
+      header p{margin:0;color:var(--muted)}
+      .grid{
+        display:grid;
+        grid-template-columns: 1fr;
+        gap:14px;
+        margin-top:14px;
+      }
+      @media(min-width:980px){
+        .grid{grid-template-columns: 1.2fr .8fr;}
+      }
+      .card{
+        border:1px solid var(--border);
+        background: rgba(15,26,46,.72);
+        border-radius:16px;
+        padding:16px 16px;
+      }
+      h2{margin:0 0 10px;font-size:18px}
+      h3{margin:18px 0 8px;font-size:15px;color:var(--text)}
+      .muted{color:var(--muted)}
+      .pill{
+        display:inline-block;
+        padding:2px 10px;
+        border-radius:999px;
+        border:1px solid var(--border);
+        background: rgba(231,238,252,.05);
+        color:var(--muted);
+        font-size:12px;
+        margin-right:6px;
+        margin-bottom:6px;
+      }
+      code, pre{
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      }
+      pre{
+        margin:10px 0;
+        padding:12px 12px;
+        border-radius:12px;
+        border:1px solid var(--border);
+        background: var(--codebg);
+        overflow:auto;
+      }
+      table{
+        width:100%;
+        border-collapse:collapse;
+        border:1px solid var(--border);
+        border-radius:12px;
+        overflow:hidden;
+        background: rgba(231,238,252,.03);
+      }
+      th,td{
+        padding:10px 10px;
+        border-bottom:1px solid var(--border);
+        vertical-align:top;
+        text-align:left;
+        font-size:13px;
+      }
+      th{color:var(--text);background:rgba(231,238,252,.05)}
+      tr:last-child td{border-bottom:none}
+      .toc a{display:block;padding:6px 0;color:var(--accent);text-decoration:none}
+      .toc a:hover{text-decoration:underline}
+      .warn{
+        border-left:3px solid var(--accent2);
+        padding:10px 12px;
+        border-radius:12px;
+        background: rgba(167,139,250,.10);
+        border:1px solid rgba(167,139,250,.22);
+      }
+      .ok{
+        border-left:3px solid var(--accent);
+        padding:10px 12px;
+        border-radius:12px;
+        background: rgba(125,211,252,.10);
+        border:1px solid rgba(125,211,252,.22);
+      }
+      .small{font-size:12px}
+      .kpi{
+        display:grid;
+        grid-template-columns:1fr 1fr;
+        gap:10px;
+        margin-top:10px;
+      }
+      .kpi > div{
+        border:1px solid var(--border);
+        background: rgba(231,238,252,.04);
+        border-radius:12px;
+        padding:10px 10px;
+      }
+      .kpi b{display:block;margin-bottom:2px}
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <h1>.pt → TensorRT <code>.engine</code> dönüşümü: gerçekten ne işe yarar, neden yaparız?</h1>
+        <p>
+          Bu doküman, senin projendeki Ultralytics YOLO akışına göre hazırlanmıştır:
+          <span class="pill">PyTorch <code>.pt</code></span>
+          <span class="pill">Ultralytics <code>model.export(format="engine")</code></span>
+          <span class="pill">TensorRT <code>.engine</code></span>
+          <span class="pill">FP16 (<code>half=True</code>)</span>
+        </p>
+      </header>
+
+      <div class="grid">
+        <section class="card">
+          <h2 id="ozet">Kısa özet</h2>
+          <div class="kpi">
+            <div>
+              <b>TensorRT <code>.engine</code> ne?</b>
+              <span class="muted">GPU’da çok hızlı inference için, belirli donanım/sürücü/TensorRT sürümüne göre derlenmiş “hazır yürütme planı”.</span>
+            </div>
+            <div>
+              <b>Neden yaparız?</b>
+              <span class="muted">Gecikmeyi düşürmek, FPS’i yükseltmek, FP16/INT8 ile daha verimli çalışmak için.</span>
+            </div>
+            <div>
+              <b>Ne “kaybederiz”?</b>
+              <span class="muted">Taşınabilirlik azalır; aynı <code>.engine</code> her GPU/TensorRT ortamında çalışmayabilir.</span>
+            </div>
+            <div>
+              <b>640×640 konusu</b>
+              <span class="muted"><code>imgsz</code> verilmezse çoğu YOLO akışında varsayılan genelde 640’tır; <code>dynamic=True</code> verilmezse shape “sabit” derlenir.</span>
+            </div>
+          </div>
+
+          <h3 id="neden-engine">1) TensorRT çıktısı (engine) gerçekten ne işe yarar?</h3>
+          <p>
+            PyTorch <code>.pt</code> dosyası “model ağırlıkları + PyTorch grafiği” gibi düşün.
+            Bu model çalışırken (özellikle GPU’da) arada ekstra katmanlar, framework overhead’i ve daha genel amaçlı kernel çağrıları olur.
+          </p>
+          <p>
+            TensorRT <code>.engine</code> ise bu modeli NVIDIA GPU için <b>optimize edip derleyen</b> bir çıktıdır:
+          </p>
+          <ul>
+            <li><b>Katman birleştirme (fusion)</b>: ardışık operasyonları tek kernel’e indirip bellek erişimini azaltır.</li>
+            <li><b>Kernel seçimi / autotuning</b>: hedef GPU’ya göre en hızlı kernel’leri seçer.</li>
+            <li><b>FP16/INT8 kullanımı</b>: daha az bellek bant genişliği, daha yüksek throughput (çoğu senaryoda daha yüksek FPS).</li>
+            <li><b>GPU bellek planlama</b>: ara tensörleri daha verimli yerleştirir.</li>
+          </ul>
+          <div class="ok">
+            <b>Sonuç:</b> Aynı model, aynı girişte genelde daha düşük gecikme ve daha yüksek FPS ile çalışır.
+            Bu projede “gerçek zamanlı webcam” veya “video analizi” için asıl motivasyon budur.
+          </div>
+
+          <h3 id="neden-yapariz">2) Biz bunu neden yapıyoruz (senin projendeki bağlam)</h3>
+          <p>
+            Senin kodunda ilk çalıştırmada <code>.engine</code> yoksa üretiliyor; sonra hep o kullanılıyor.
+            Bu sayede:
+          </p>
+          <ul>
+            <li><b>İlk çalıştırma</b>: biraz uzun sürer (derleme/optimizasyon).</li>
+            <li><b>Sonraki çalıştırmalar</b>: çok daha hızlı açılır ve inference daha hızlı olur.</li>
+          </ul>
+          <p class="muted small">
+            Not: <code>.engine</code> genellikle “o ortam”a bağlıdır. GPU modeli, driver, CUDA/TensorRT sürümü değişirse engine yeniden üretmek gerekebilir.
+          </p>
+
+          <h3 id="pt-vs-engine">3) <code>.pt</code> ile <code>.engine</code> arasındaki kritik farklar</h3>
+          <table>
+            <thead>
+              <tr><th>Başlık</th><th><code>.pt</code> (PyTorch)</th><th><code>.engine</code> (TensorRT)</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><b>Taşınabilirlik</b></td>
+                <td>Yüksek (PyTorch olan her yerde)</td>
+                <td>Düşük/Orta (genelde NVIDIA GPU + uyumlu TRT ortamı gerekir)</td>
+              </tr>
+              <tr>
+                <td><b>Performans</b></td>
+                <td>İyi ama framework overhead’i var</td>
+                <td>Genelde daha iyi (optimizasyon + kernel tuning)</td>
+              </tr>
+              <tr>
+                <td><b>Precision</b></td>
+                <td>Çoğunlukla FP32 (istersen AMP/FP16)</td>
+                <td>FP16/INT8 gibi modlar “engine” seviyesinde oturur</td>
+              </tr>
+              <tr>
+                <td><b>Girdi boyutu</b></td>
+                <td>Esnek (çoğu zaman dinamik)</td>
+                <td>Derleme parametrelerine bağlı (sabit veya dinamik)</td>
+              </tr>
+              <tr>
+                <td><b>İlk kurulum maliyeti</b></td>
+                <td>Yok</td>
+                <td>Var (export/derleme süreleri)</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <h3 id="640x640">4) “Px değeri yok — 640×640 default mu?” sorusu</h3>
+          <p>
+            Senin kodunda <code>model.export(...)</code> çağrısında <b><code>imgsz</code> parametresi verilmemiş</b>.
+            Bu durumda Ultralytics tarafı genellikle <b>varsayılan bir giriş boyutu</b> kullanır (pratikte çoğu YOLO modelinde bu <b>640</b> olur).
+          </p>
+          <div class="warn">
+            <b>Önemli:</b> TensorRT engine “hangi input shape” ile derleneceğini bilmek zorundadır.
+            <br />
+            - <b>Sabit shape</b> (ör. 1×3×640×640) ile derlersen, inference en stabil/kolay olur.
+            <br />
+            - <b>Dinamik shape</b> istiyorsan export sırasında <code>dynamic=True</code> gibi seçeneklerle (Ultralytics sürümüne bağlı) profile tanımlanır.
+          </div>
+          <p>
+            Ayrıca “giriş görüntüsü” webcam’den <code>frame</code> olarak gelse bile YOLO pipeline içinde genelde:
+          </p>
+          <ul>
+            <li><b>Letterbox resize</b>: görüntü en/boy oranını koruyarak <code>imgsz</code>’ye oturtulur, kalan yer padding ile doldurulur.</li>
+            <li><b>Normalize</b>: piksel değerleri [0..255] → [0..1] gibi ölçeklenir (modelin beklediği biçim).</li>
+          </ul>
+          <p class="muted">
+            Yani sen “px değeri” yazmasan bile, modelin inference girişinde fiilen bir <b>hedef tensör boyutu</b> vardır. Export aşaması da bunu temel alır.
+          </p>
+
+          <h3 id="senin-kodun">5) Senin kodunda tam olarak ne yapıyoruz?</h3>
+          <p class="muted">
+            Projede aynı mantık iki yerde var: <code>uyku_takip.py</code> (webcam) ve <code>model_karsilastirma_app.py</code> (video/Streamlit).
+          </p>
+          <pre><code>model.export(
+  format="engine",
+  half=True,     # FP16
+  device=0       # GPU id
+)</code></pre>
+          <ul>
+            <li><b><code>format="engine"</code></b>: çıktı TensorRT engine olacak.</li>
+            <li><b><code>half=True</code></b>: FP16 hesaplama (performans için).</li>
+            <li><b><code>device=0</code></b>: 0. GPU üzerinden derle/çalıştır.</li>
+          </ul>
+          <p>
+            Engine oluşunca dosyaya yazılır (<code>yolo11n.engine</code> / <code>yolo11s.engine</code>) ve sonraki çalıştırmada direkt:
+          </p>
+          <pre><code>model = YOLO("yolo11n.engine")</code></pre>
+
+          <h3 id="parametreler">6) “Gelebilecek tüm parametreler” (pratik liste + ne işe yarar)</h3>
+          <p class="muted">
+            Ultralytics’in <code>model.export(...)</code> parametre seti sürüme göre ufak farklar gösterebilir.
+            Aşağıdaki liste, gerçek hayatta en çok kullanılan/çıkan export parametrelerini “anlamı” ile birlikte kapsar.
+          </p>
+
+          <h3>6.1 Export format / hedef ayarlar</h3>
+          <table>
+            <thead><tr><th>Parametre</th><th>Ne işe yarar?</th><th>Not</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><code>format</code></td>
+                <td>Çıktı formatını seçer: <code>"engine"</code> (TensorRT), <code>"onnx"</code>, <code>"openvino"</code>, <code>"torchscript"</code>, vb.</td>
+                <td>Senin projede <code>"engine"</code>.</td>
+              </tr>
+              <tr>
+                <td><code>device</code></td>
+                <td>Export ve/veya kalibrasyon/derleme işleminin hangi cihazda yapılacağını belirtir.</td>
+                <td>Genelde <code>0</code> ilk GPU.</td>
+              </tr>
+              <tr>
+                <td><code>batch</code></td>
+                <td>Export sırasında hedef batch boyutu (statik engine için kritiktir).</td>
+                <td>Gerçek zamanlı webcam’de çoğunlukla <code>1</code>.</td>
+              </tr>
+              <tr>
+                <td><code>imgsz</code></td>
+                <td>Modelin export/inference için hedef input boyutu (örn <code>640</code> veya <code>(640,640)</code>).</td>
+                <td>Verilmezse tipik YOLO varsayılanı çoğunlukla 640’tır.</td>
+              </tr>
+              <tr>
+                <td><code>dynamic</code></td>
+                <td>Dinamik input shape profile’ı (TensorRT için) üretmeyi hedefler.</td>
+                <td>Sürüm/arkaplan kütüphanelere bağlı davranabilir.</td>
+              </tr>
+              <tr>
+                <td><code>simplify</code></td>
+                <td>Özellikle ONNX export’ta graph sadeleştirme (onnxsim) gibi adımlar.</td>
+                <td>Engine yolunda dolaylı etkiler olabilir.</td>
+              </tr>
+              <tr>
+                <td><code>opset</code></td>
+                <td>ONNX opset sürümü (ONNX export ile ilgili).</td>
+                <td>Engine’e giden ara adım ONNX ise önem kazanır.</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <h3>6.2 Precision / hız parametreleri</h3>
+          <table>
+            <thead><tr><th>Parametre</th><th>Ne işe yarar?</th><th>Ne zaman?</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><code>half</code></td>
+                <td>FP16 (yarı hassasiyet) kullanır. Genelde FPS artar, küçük accuracy farkı olabilir.</td>
+                <td>Senin projede açık (<code>true</code>).</td>
+              </tr>
+              <tr>
+                <td><code>int8</code></td>
+                <td>INT8 quantization ile daha hızlı/az bellekli inference hedefler.</td>
+                <td>Kalibrasyon veri seti gerektirebilir; her zaman kolay değildir.</td>
+              </tr>
+              <tr>
+                <td><code>workspace</code></td>
+                <td>TensorRT builder’ın kullanabileceği maksimum bellek (MB/GB gibi).</td>
+                <td>Yüksek workspace bazen daha iyi optimizasyon sağlar; VRAM’e dikkat.</td>
+              </tr>
+              <tr>
+                <td><code>verbose</code></td>
+                <td>Export/derleme log seviyesini arttırır.</td>
+                <td>Hata ayıklamada faydalı.</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <h3>6.3 Model/çıktı içerikleriyle ilgili parametreler</h3>
+          <table>
+            <thead><tr><th>Parametre</th><th>Ne işe yarar?</th><th>Not</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><code>nms</code></td>
+                <td>NMS (Non-Maximum Suppression) katmanını export edilmiş modele “entegre” etmeyi hedefler.</td>
+                <td>Kullanım senaryosuna göre iyi/kötü olabilir; bazı runtime’larda esneklik azaltır.</td>
+              </tr>
+              <tr>
+                <td><code>agnostic_nms</code></td>
+                <td>Sınıf agnostik NMS davranışı.</td>
+                <td>Model kullanım biçimine göre.</td>
+              </tr>
+              <tr>
+                <td><code>max_det</code></td>
+                <td>Maksimum detection sayısı (export sonrası çıkış boyutlarını etkileyebilir).</td>
+                <td>Engine output shape’ini etkileyebilir.</td>
+              </tr>
+              <tr>
+                <td><code>iou</code>, <code>conf</code></td>
+                <td>NMS eşiği/konf eşiği gibi inference parametreleri (bazı akışlarda export ile ilişkilidir).</td>
+                <td>Senin inference çağrısında zaten <code>conf</code> veriyorsun.</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <h3>6.4 Dosya yolu / metadata / diğerleri</h3>
+          <table>
+            <thead><tr><th>Parametre</th><th>Ne işe yarar?</th><th>Not</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><code>path</code> / <code>project</code> / <code>name</code></td>
+                <td>Export çıktısının nereye yazılacağını ve klasör adını belirleyebilir.</td>
+                <td>Senin projede “varsayılan” yere yazdırılıyor (aynı klasör).</td>
+              </tr>
+              <tr>
+                <td><code>exist_ok</code></td>
+                <td>Çıktı klasörü zaten varsa üzerine yazma davranışı.</td>
+                <td>Sürüme bağlı olabilir.</td>
+              </tr>
+              <tr>
+                <td><code>data</code></td>
+                <td>INT8 kalibrasyon gibi durumlarda dataset tanımı/metadata için kullanılır.</td>
+                <td>INT8 için pratikte önemli.</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="warn">
+            <b>Gerçekçi uyarı:</b> “Tüm parametreler” Ultralytics sürümüyle birebir değişebilir.
+            Bu HTML’de amaç; hangi knob’ların olduğunu, engine’i neyin etkilediğini ve senin kodunun neleri “varsayılan”a bıraktığını netleştirmek.
+          </div>
+
+          <h3 id="oneriler">7) Bu projede hangi parametreleri açıkça vermek mantıklı olabilir?</h3>
+          <ul>
+            <li><b><code>imgsz=640</code></b>: “ben 640 derlemek istiyorum”u netleştirir. (Varsayılan olsa bile belirsizliği kaldırır.)</li>
+            <li><b><code>batch=1</code></b>: webcam ve tek frame işleme için tipik seçim.</li>
+            <li><b><code>dynamic=True</code></b> (gerekliyse): farklı çözünürlüklerde girdi alacaksan düşünülür; ama engine profil karmaşıklığı artar.</li>
+            <li><b><code>workspace=...</code></b>: daha agresif optimizasyonlar için (VRAM yeterliyse).</li>
+          </ul>
+          <p class="muted small">
+            Eğer hedefin “en stabil gerçek zamanlı” ise genelde statik <code>imgsz</code> + batch=1 + FP16 en pratik kombinasyondur.
+          </p>
+
+          <h3 id="sorunlar">8) Sık karşılaşılan sorunlar (engine neden “bozulur” veya yeniden gerekir?)</h3>
+          <ul>
+            <li><b>GPU değişimi</b>: farklı mimari (ör. Turing → Ampere) engine’i geçersiz kılabilir.</li>
+            <li><b>Driver/CUDA/TensorRT yükseltmesi</b>: uyumsuzluk yaratabilir.</li>
+            <li><b>Engine dosyası taşınırsa</b>: başka PC’de çalışmayabilir (özellikle farklı GPU’da).</li>
+            <li><b>Dinamik shape / batch</b>: export profilin dışına çıkılırsa çalışma zamanı hata verebilir.</li>
+          </ul>
+        </section>
+
+        <aside class="card">
+          <h2>İçindekiler</h2>
+          <div class="toc">
+            <a href="#ozet">Kısa özet</a>
+            <a href="#neden-engine">1) Engine ne işe yarar?</a>
+            <a href="#neden-yapariz">2) Neden yapıyoruz?</a>
+            <a href="#pt-vs-engine">3) .pt vs .engine</a>
+            <a href="#640x640">4) 640×640 / px konusu</a>
+            <a href="#senin-kodun">5) Bu projede ne yapıyoruz?</a>
+            <a href="#parametreler">6) Export parametreleri</a>
+            <a href="#oneriler">7) Bu projeye öneriler</a>
+            <a href="#sorunlar">8) Sık sorunlar</a>
+          </div>
+
+          <h3>Bu repo özelinde</h3>
+          <p class="muted small">
+            Kodun davranışı:
+            <br />
+            - <b><code>.engine</code> varsa</b> → direkt yükle
+            <br />
+            - <b>yoksa</b> → <code>.pt</code> yükle/indir → <code>export(engine, half, device)</code> → <code>.engine</code> yükle
+          </p>
+
+          <h3>640×640 hakkında hızlı cevap</h3>
+          <div class="ok small">
+            Kodda <code>imgsz</code> verilmediği için “çoğu senaryoda” varsayılan 640 kabul edilir.
+            Netlik istiyorsan export’a <code>imgsz=640</code> eklemek en temiz çözümdür.
+          </div>
+
+          <h3>Son not</h3>
+          <p class="muted small">
+            Eğer istersen, bu projedeki iki export çağrısını da güncelleyip
+            <code>imgsz</code>/<code>batch</code>/<code>dynamic</code> gibi parametreleri açıkça set edecek şekilde düzenleyebilirim.
+          </p>
+        </aside>
+      </div>
+    </div>
+  </body>
+</html>
