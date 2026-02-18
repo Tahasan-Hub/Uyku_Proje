@@ -12,7 +12,7 @@ Bu proje iki ana bileşenden oluşur:
 Proje klasörüne geç:
 
 ```bash
-cd "c:\Users\tahas\OneDrive\Desktop\Uyku Projesi"
+cd "C:\projeler\uyku_tespit"
 ```
 
 Gerekli Python paketlerini yükle:
