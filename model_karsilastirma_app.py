@@ -306,8 +306,8 @@ class ViolationManager:
                 ViolationEpisode("Hareketsizlik", start_sec=self.global_still_start_sec, end_sec=last_sec)
             )
         if self.global_eye_active and self.global_eye_start_sec is not None:
-                self.episodes.append(
-                    ViolationEpisode("Goz Kapali", start_sec=self.global_eye_start_sec, end_sec=last_sec)
+            self.episodes.append(
+                ViolationEpisode("Goz Kapali", start_sec=self.global_eye_start_sec, end_sec=last_sec)
                 )
 
 
