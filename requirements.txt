@@ -3,4 +3,8 @@ opencv-python
 mediapipe
 numpy
 streamlit
-
+pygame
+pandas
+plotly
+matplotlib
+tqdm

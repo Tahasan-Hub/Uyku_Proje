@@ -1,0 +1,32 @@
+{
+  "selected_model": "yolo11n",
+  "model_configs": {
+    "yolo11n": {
+      "pt": "yolo11n.pt",
+      "engine": "yolo11n.engine",
+      "label": "YOLO11n (Nano)"
+    },
+    "yolo11s": {
+      "pt": "yolo11s.pt",
+      "engine": "yolo11s.engine",
+      "label": "YOLO11s (Small)"
+    }
+  },
+  "alarm_settings": {
+    "uyari_sesi": "beep.wav",
+    "acil_durum_sesi": "Siren.wav",
+    "cooldown_seconds": 3.0,
+    "enabled": true
+  },
+  "device": 0,
+  "conf_threshold": 0.4,
+  "iou_track_threshold": 100,
+  "stillness_seconds": 2.0,
+  "eye_closed_seconds": 2.0,
+  "movement_pixel_threshold": 20.0,
+  "ear_threshold": 0.21,
+  "save_cooldown_seconds": 1.0,
+  "output_dir": "ihlal_kayitlari",
+  "output_report_dir": "raporlar",
+  "log_dir": "logs"
+}

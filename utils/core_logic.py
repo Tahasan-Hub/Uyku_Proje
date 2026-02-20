@@ -266,3 +266,10 @@ class ViolationManager:
             self.episodes.append(ViolationEpisode("Hareketsizlik", self.global_still_start_sec, last_time))
         if self.global_eye_active and self.global_eye_start_sec is not None:
             self.episodes.append(ViolationEpisode("Goz Kapali", self.global_eye_start_sec, last_time))
+
+def is_point_in_rect(point: Tuple[float, float], rect: Tuple[int, int, int, int]) -> bool:
+    """Bir noktanın (x, y) verilen dikdörtgen (x1, y1, x2, y2) içinde olup olmadığını kontrol eder."""
+    x, y = point
+    x1, y1, x2, y2 = rect
+    return x1 <= x <= x2 and y1 <= y <= y2
+

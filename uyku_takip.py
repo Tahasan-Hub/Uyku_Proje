@@ -2,6 +2,8 @@ import os
 import time
 import math
 import cv2
+import json
+import logging
 import numpy as np
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -9,387 +11,236 @@ from typing import Dict, Tuple, List, Optional
 
 from ultralytics import YOLO
 import mediapipe as mp
+import pygame
 
 from utils.core_logic import (
+
     CentroidTracker, PersonState, ViolationManager as BaseViolationManager,
-    eye_aspect_ratio, LEFT_EYE_IDX, RIGHT_EYE_IDX, NOSE_IDX
+
+    eye_aspect_ratio, LEFT_EYE_IDX, RIGHT_EYE_IDX, NOSE_IDX, is_point_in_rect
+
 )
 
 
-# ===========================================================
-# MODEL & GENEL AYARLAR
-# ===========================================================
-# ... (sabitler aynı kalıyor) ...
-PT_MODEL_PATH = "yolo11n.pt"          # YOLOv11n PyTorch ağırlık dosyası
-ENGINE_MODEL_PATH = "yolo11n.engine"  # TensorRT engine dosyası
-OUTPUT_DIR = "ihlal_kayitlari"        # İhlal kayıtlarının kaydedileceği klasör
 
-DEVICE = 0  # 0: ilk GPU (TensorRT engine de buna göre derlenecek)
-CONF_THRESH = 0.4  # Kişi tespiti için güven eşiği
-IOU_TRACK_THRESH = 100  # Takip için maksimum merkez mesafe (piksel)
-
-STILLNESS_SECONDS = 10.0      # Hareketsizlik ihlali için süre (sn)
-EYE_CLOSED_SECONDS = 10.0     # Göz kapalı ihlali için süre (sn)
-MOVEMENT_PIXEL_THRESHOLD = 20.0  # Hareketsizlik için merkez hareket eşiği (piksel)
-EAR_THRESHOLD = 0.21          # Göz kapalılığı için EAR eşiği (kişiye göre ayarlanabilir)
-
-SAVE_COOLDOWN_SECONDS = 1.0   # Aynı anda çok fazla kayıt almamak için minimum aralık (sn)
+# ... (Previous constants)
 
 
-# ===========================================================
-# ÖZEL İHLAL YÖNETİCİSİ (Webcam için Kaydetme Özellikli)
-# ===========================================================
 
-class WebcamViolationManager(BaseViolationManager):
-    """
-    Core ViolationManager'a ek olarak kare kaydetme cooldown kontrolü ekler.
-    """
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.last_save_time: float = 0.0
+def select_monitoring_zones(cap):
 
-    def should_save_frame(self) -> bool:
-        current_time = time.time()
-        if current_time - self.last_save_time >= SAVE_COOLDOWN_SECONDS:
-            self.last_save_time = current_time
-            return True
-        return False
+    """Kullanıcının ekran üzerinde birden fazla ROI çizmesini sağlar."""
 
+    logger.info("Bölge seçimi ekranı açıldı. 'r' tuşuyla yeni bir bölge çizin, 'enter' ile bitirin.")
 
-# ===========================================================
-# EAR (Eye Aspect Ratio) HESABI - MediaPipe Face Mesh
-# ===========================================================
+    ret, frame = cap.read()
 
-# Resmi MediaPipe paketinde FaceMesh'e bu şekilde erişilir
-mp_face_mesh = mp.solutions.face_mesh
+    if not ret: return []
 
-def compute_ear_for_faces(
-    frame: np.ndarray,
-    face_landmarks_list,
-    track_boxes: Dict[int, Tuple[int, int, int, int]],
-    violation_manager: WebcamViolationManager,
-):
-    """
-    - MediaPipe FaceMesh çıktısını kullanarak her yüz için EAR hesaplar.
-    - Burun noktasının bulunduğu bounding box'a bakarak ilgili track_id'yi bulur.
-    - Bulunan kişi için EAR değerini ViolationManager'a gönderir.
-    """
-    h, w, _ = frame.shape
-    current_time = time.time()
+    
 
-    for face_landmarks in face_landmarks_list:
-        coords: List[Tuple[int, int]] = []
-        for lm in face_landmarks.landmark:
-            x_px = int(lm.x * w)
-            y_px = int(lm.y * h)
-            coords.append((x_px, y_px))
+    # OpenCV'nin multi ROI seçicisi
 
-        left_eye = [coords[i] for i in LEFT_EYE_IDX]
-        right_eye = [coords[i] for i in RIGHT_EYE_IDX]
+    zones = cv2.selectROIs("Bolge Secimi (Enter ile bitir, ESC ile iptal)", frame, fromCenter=False, showCrosshair=True)
 
-        ear = eye_aspect_ratio(left_eye + right_eye) if len(left_eye+right_eye) == 12 else 0.0
-        # Not: core logic'teki eye_aspect_ratio 6 nokta bekliyor. 
-        # Burada her gözü ayrı hesaplayıp ortalamasını alalım.
-        left_ear = eye_aspect_ratio(left_eye)
-        right_ear = eye_aspect_ratio(right_eye)
-        ear = (left_ear + right_ear) / 2.0
+    cv2.destroyWindow("Bolge Secimi (Enter ile bitir, ESC ile iptal)")
 
-        nose_x, nose_y = coords[NOSE_IDX]
-        assigned_track_id = None
-        for tid, bbox in track_boxes.items():
-            x1, y1, x2, y2 = bbox
-            if x1 <= nose_x <= x2 and y1 <= nose_y <= y2:
-                assigned_track_id = tid
-                break
+    
 
-        if assigned_track_id is not None:
-            violation_manager.update_eye_state(assigned_track_id, ear, current_time)
+    # cv2.selectROIs [x, y, w, h] formatında döner, biz [x1, y1, x2, y2] yapalım
+
+    formatted_zones = []
+
+    for i, z in enumerate(zones):
+
+        x, y, w, h = z
+
+        formatted_zones.append((x, y, x+w, y+h))
+
+        logger.info(f"Bolge {i+1} tanimlandi: {z}")
+
+    return formatted_zones
 
 
-# ===========================================================
-# YOLO + TENSORRT MODEL YÜKLEME / OLUŞTURMA
-# ===========================================================
-
-def load_or_build_trt_model() -> YOLO:
-    """
-    - Eğer mevcutsa TensorRT engine modelini (`.engine`) yükler.
-    - Yoksa .pt modelini yükleyip TensorRT FP16 engine olarak export eder.
-    - Sonrasında engine modelini kullanarak YOLO nesnesini döndürür.
-    """
-    # Mevcut engine dosyasını kontrol et
-    if os.path.exists(ENGINE_MODEL_PATH):
-        print(f"[INFO] Mevcut TensorRT engine bulundu: {ENGINE_MODEL_PATH}")
-        model = YOLO(ENGINE_MODEL_PATH)
-        return model
-
-    # Engine yoksa, önce .pt dosyasını kontrol et
-    if not os.path.exists(PT_MODEL_PATH):
-        # Bu çağrı, ağırlıkları ultralytics'ten indirecektir
-        print(f"[INFO] {PT_MODEL_PATH} bulunamadı, Ultralytics üzerinden indirilecek.")
-        model = YOLO("yolo11n.pt")
-    else:
-        print(f"[INFO] PyTorch model yüklenecek: {PT_MODEL_PATH}")
-        model = YOLO(PT_MODEL_PATH)
-
-    print("[INFO] TensorRT FP16 engine üretiliyor (ilk seferde biraz sürebilir)...")
-    # Ultralytics export fonksiyonu TensorRT engine oluşturur
-    model.export(
-        format="engine",
-        half=True,   # FP16 hassasiyet
-        device=DEVICE
-    )
-
-    # Varsayılan olarak `yolo11n.engine` oluşmasını bekliyoruz
-    if not os.path.exists(ENGINE_MODEL_PATH):
-        raise FileNotFoundError(
-            f"{ENGINE_MODEL_PATH} oluşturulamadı. Export işleminde bir hata olmuş olabilir."
-        )
-
-    print(f"[INFO] TensorRT engine başarıyla oluşturuldu: {ENGINE_MODEL_PATH}")
-    model = YOLO(ENGINE_MODEL_PATH)
-    return model
-
-
-# ===========================================================
-# İHLAL KAYDI ALMA (GÖRÜNTÜ KAYDETME)
-# ===========================================================
-
-def save_violation_frame(frame: np.ndarray, reasons: List[str]):
-    """
-    İhlal anındaki kareyi, tarih/saat ve ihlal nedeni ile birlikte
-    `ihlal_kayitlari` klasörüne JPEG olarak kaydeder.
-    """
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    now = datetime.now()
-    timestamp_str = now.strftime("%Y-%m-%d_%H-%M-%S")
-
-    reason_text = " & ".join(reasons)
-    filename = f"ihlal_{timestamp_str}_{reason_text.replace(' ', '_')}.jpg"
-    filepath = os.path.join(OUTPUT_DIR, filename)
-
-    # Kaydedilecek kare üzerine metin yaz
-    annotated = frame.copy()
-    info_text = f"Tarih/Saat: {now.strftime('%Y-%m-%d %H:%M:%S')} - Neden: {reason_text}"
-
-    cv2.putText(
-        annotated,
-        info_text,
-        (10, annotated.shape[0] - 20),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (0, 0, 255),
-        2,
-        cv2.LINE_AA,
-    )
-
-    cv2.imwrite(filepath, annotated)
-    print(f"[KAYIT] İhlal görüntüsü kaydedildi: {filepath}")
-
-
-# ===========================================================
-# ANA ÇALIŞMA DÖNGÜSÜ
-# ===========================================================
 
 def main():
-    """
-    Kameradan gelen görüntü üzerinde:
-    - YOLO + TensorRT ile kişi tespiti
-    - Basit centroid tracker ile ID atama
-    - MediaPipe FaceMesh ile EAR (göz açıklık oranı) hesabı
-    - 10 sn hareketsizlik veya göz kapalılığı durumunda ihlal tespiti ve kayıt
-    - Ekranda FPS, EAR, geri sayım sayaçları ve ihlal uyarılarının gösterimi
-    işlemlerini yapar.
-    """
-    # Modeli yükle veya ilk sefer için TensorRT engine oluştur
+
     model = load_or_build_trt_model()
 
-    # Video kaynağını aç (0: varsayılan kamera)
     cap = cv2.VideoCapture(0)
+
     if not cap.isOpened():
-        print("[HATA] Kamera açılamadı.")
+
+        logger.error("Kamera açılamadı.")
+
         return
 
+
+
+    # GÖREV 5: ÇOKLU BÖLGE SEÇİMİ
+
+    monitoring_zones = select_monitoring_zones(cap)
+
+    if not monitoring_zones:
+
+        logger.warning("Hic bolge secilmedi. Tum ekran izlenecek.")
+
+
+
     tracker = CentroidTracker(max_distance=IOU_TRACK_THRESH)
+
     violation_manager = WebcamViolationManager(
+
         still_threshold=STILLNESS_SECONDS,
+
         eye_threshold=EYE_CLOSED_SECONDS,
+
         movement_threshold=MOVEMENT_PIXEL_THRESHOLD,
+
         ear_threshold=EAR_THRESHOLD
+
     )
 
-    # MediaPipe Face Mesh başlat
-    face_mesh = mp_face_mesh.FaceMesh(
-        static_image_mode=False,
-        max_num_faces=5,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
+    face_mesh = mp_face_mesh.FaceMesh(refine_landmarks=True)
 
-    fps = 0.0
+
+
+    tracked_persons = set()
+
+    warning_logged_still = set()
+
+    warning_logged_eye = set()
+
+    violation_logged_still = set()
+
+    violation_logged_eye = set()
+
+
+
     last_time = time.time()
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("[HATA] Kare okunamadı, döngü sonlandırılıyor.")
-            break
+    fps = 0.0
 
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+
+    while True:
+
+        ret, frame = cap.read()
+
+        if not ret: break
+
         h, w, _ = frame.shape
 
-        # -----------------------------------
-        # 1) YOLO ile kişi tespiti (TensorRT engine ile)
-        # -----------------------------------
-        yolo_results = model(
-            frame,
-            conf=CONF_THRESH,
-            classes=[0],   # 0: person (COCO)
-            device=DEVICE,
-            verbose=False
-        )
+        yolo_results = model(frame, conf=CONF_THRESH, classes=[0], device=DEVICE, verbose=False)
 
-        detections: List[Tuple[int, int, int, int]] = []
-        if len(yolo_results) > 0:
-            result = yolo_results[0]
-            if result.boxes is not None:
-                for box in result.boxes:
-                    x1, y1, x2, y2 = box.xyxy[0].tolist()
-                    x1 = int(max(0, x1))
-                    y1 = int(max(0, y1))
-                    x2 = int(min(w - 1, x2))
-                    y2 = int(min(h - 1, y2))
-                    detections.append((x1, y1, x2, y2))
+        
 
-        # -----------------------------------
-        # 2) Takip (ID atama)
-        # -----------------------------------
-        track_boxes = tracker.update(detections)
-        violation_manager.update_tracks(track_boxes)
+        raw_detections = [list(map(int, box.xyxy[0].tolist())) for box in yolo_results[0].boxes] if yolo_results[0].boxes is not None else []
 
-        # -----------------------------------
-        # 3) MediaPipe FaceMesh ile EAR hesabı
-        # -----------------------------------
-        face_results = face_mesh.process(frame_rgb)
+        
+
+        # GÖREV 5: BÖLGE FİLTRELEME
+
+        filtered_detections = []
+
+        if monitoring_zones:
+
+            for det in raw_detections:
+
+                cx, cy = (det[0] + det[2]) / 2, (det[1] + det[3]) / 2
+
+                if any(is_point_in_rect((cx, cy), zone) for zone in monitoring_zones):
+
+                    filtered_detections.append(det)
+
+        else:
+
+            filtered_detections = raw_detections
+
+
+
+        track_boxes = tracker.update(filtered_detections)
+
+        
+
+        # Görselleştirme: Bölgeleri çiz
+
+        for i, zone in enumerate(monitoring_zones):
+
+            cv2.rectangle(frame, (zone[0], zone[1]), (zone[2], zone[3]), (0, 255, 255), 2)
+
+            cv2.putText(frame, f"Bolge {i+1}", (zone[0], zone[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+
+        
+        # [INFO] Kisi tespit edildi
+        for tid in track_boxes:
+            if tid not in tracked_persons:
+                logger.info(f"Kisi tespit edildi: ID={tid}")
+                tracked_persons.add(tid)
+        
+        violation_manager.update_tracks(track_boxes, time.time())
+        face_results = face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         if face_results.multi_face_landmarks:
-            compute_ear_for_faces(
-                frame,
-                face_results.multi_face_landmarks,
-                track_boxes,
-                violation_manager,
-            )
+            compute_ear_for_faces(frame, face_results.multi_face_landmarks, track_boxes, violation_manager)
 
-        # -----------------------------------
-        # 4) İhlal durumlarını hesapla
-        # -----------------------------------
-        global_violation, reasons, per_person_timers = violation_manager.compute_violations()
+        current_time_val = time.time()
+        global_violation, reasons, per_person_timers = violation_manager.compute_violations(current_time_val)
 
-        # -----------------------------------
-        # 5) Çizimler: bounding box, ID, sayaçlar, EAR
-        # -----------------------------------
-        for tid, bbox in track_boxes.items():
-            x1, y1, x2, y2 = bbox
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        # REHBERE UYGUN SMART LOGGING
+        for tid, state in violation_manager.person_states.items():
+            # Hareketsizlik Süreci
+            if state.still_start_time is not None:
+                if tid not in warning_logged_still:
+                    logger.warning(f"ID={tid} hareketsizlik suresi basladi")
+                    warning_logged_still.add(tid)
+                
+                elapsed = current_time_val - state.still_start_time
+                if elapsed >= STILLNESS_SECONDS and tid not in violation_logged_still:
+                    logger.critical(f"ID={tid} HAREKETSIZLIK IHLALI ({STILLNESS_SECONDS} sn)")
+                    violation_logged_still.add(tid)
+            else:
+                warning_logged_still.discard(tid)
+                violation_logged_still.discard(tid)
 
-            person_info = per_person_timers.get(
-                tid,
-                {"still": STILLNESS_SECONDS, "eye": EYE_CLOSED_SECONDS, "ear": 0.0},
-            )
-            still_remaining = person_info["still"]
-            eye_remaining = person_info["eye"]
-            ear_val = person_info["ear"]
+            # Göz Kapalılığı Süreci
+            if state.eye_closed_start_time is not None:
+                if tid not in warning_logged_eye:
+                    logger.warning(f"ID={tid} goz kapaliligi suresi basladi")
+                    warning_logged_eye.add(tid)
+                
+                elapsed = current_time_val - state.eye_closed_start_time
+                if elapsed >= EYE_CLOSED_SECONDS and tid not in violation_logged_eye:
+                    logger.critical(f"ID={tid} GOZ KAPALI IHLALI ({EYE_CLOSED_SECONDS} sn)")
+                    violation_logged_eye.add(tid)
+            else:
+                warning_logged_eye.discard(tid)
+                violation_logged_eye.discard(tid)
 
-            # ID yazısı
-            cv2.putText(
-                frame,
-                f"ID: {tid}",
-                (x1, max(0, y1 - 10)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA,
-            )
-
-            # Hareketsizlik geri sayım
-            cv2.putText(
-                frame,
-                f"Hareketsiz: {still_remaining:4.1f}s",
-                (x1, y2 + 20 if y2 + 20 < h else y2),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
-
-            # Göz kapalılık geri sayım + EAR
-            cv2.putText(
-                frame,
-                f"Goz Kapali: {eye_remaining:4.1f}s  EAR:{ear_val:.3f}",
-                (x1, y2 + 40 if y2 + 40 < h else y2 + 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (255, 255, 0),
-                1,
-                cv2.LINE_AA,
-            )
-
-        # -----------------------------------
-        # 6) Global ihlal uyarısı ve kayıt
-        # -----------------------------------
-        if global_violation and reasons:
-            warning_text = "UYKU IHLALI: " + " / ".join(reasons)
-            cv2.putText(
-                frame,
-                warning_text,
-                (50, 80),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.2,
-                (0, 0, 255),
-                3,
-                cv2.LINE_AA,
-            )
-
-            # İhlal anında kareyi kaydet (cooldown ile)
+        if global_violation:
+            play_alert_sound(reasons)
             if violation_manager.should_save_frame():
                 save_violation_frame(frame, reasons)
+            cv2.putText(frame, "UYKU IHLALI!", (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+        else:
+            pygame.mixer.stop()
 
-        # -----------------------------------
-        # 7) FPS hesabı ve ekranda gösterimi
-        # -----------------------------------
+        # FPS & UI
         current_time = time.time()
         dt = current_time - last_time
         last_time = current_time
-        if dt > 0:
-            fps = fps * 0.9 + (1.0 / dt) * 0.1 if fps > 0 else 1.0 / dt
+        if dt > 0: fps = fps * 0.9 + (1.0 / dt) * 0.1 if fps > 0 else 1.0 / dt
+        cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.imshow("Yapay Zeka Uyku Takibi", frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"): break
+        elif key == ord("m"):
+            global is_muted
+            is_muted = not is_muted
+            logger.info(f"Ses: {'KAPALI' if is_muted else 'ACIK'}")
 
-        cv2.putText(
-            frame,
-            f"FPS: {fps:.1f}",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-
-        # -----------------------------------
-        # 8) Pencereyi göster ve klavye kontrolü
-        # -----------------------------------
-        cv2.imshow("Yapay Zeka Uyku ve Guvenlik Takip Sistemi", frame)
-
-        # 'q' tuşu ile çıkış
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-
-    # Kaynakları düzgün bir şekilde serbest bırak
     cap.release()
     cv2.destroyAllWindows()
-    face_mesh.close()
-
 
 if __name__ == "__main__":
     main()
