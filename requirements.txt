@@ -1,6 +1,6 @@
 ultralytics
 opencv-python
-mediapipe
+mediapipe>=0.10.30
 numpy
 streamlit
 pygame

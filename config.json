@@ -21,10 +21,16 @@
   "device": 0,
   "conf_threshold": 0.4,
   "iou_track_threshold": 100,
-  "stillness_seconds": 2.0,
-  "eye_closed_seconds": 2.0,
+  "stillness_seconds": 6.0,
+  "eye_closed_seconds": 6.0,
   "movement_pixel_threshold": 20.0,
   "ear_threshold": 0.21,
+  "telegram_settings": {
+    "token": "BURAYA_TELEGRAM_TOKEN_GELECEK",
+    "chat_id": "BURAYA_CHAT_ID_GELECEK",
+    "notification_seconds": 30.0,
+    "enabled": true
+  },
   "save_cooldown_seconds": 1.0,
   "output_dir": "ihlal_kayitlari",
   "output_report_dir": "raporlar",

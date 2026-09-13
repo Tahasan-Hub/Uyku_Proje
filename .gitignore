@@ -67,3 +67,10 @@ htmlcov/
 
 # mypy
 .mypy_cache/
+
+# Kamera ihlal fotoğrafları (Kişisel veri ve boyut tasarrufu)
+ihlal_kayitlari/
+
+# Log ve Yedek dosyaları
+*.log
+*.windows-yedek

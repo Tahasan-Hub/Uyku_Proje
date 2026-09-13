@@ -2,18 +2,12 @@ import os
 import time
 import json
 import cv2
-import logging
-import numpy as np
 from ultralytics import YOLO
 import mediapipe as mp
 from datetime import datetime
 import csv
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-
-from utils.core_logic import (
-    CentroidTracker, eye_aspect_ratio, LEFT_EYE_IDX, RIGHT_EYE_IDX
-)
 
 # ===========================================================
 # CONFIGURATION & LOGGING

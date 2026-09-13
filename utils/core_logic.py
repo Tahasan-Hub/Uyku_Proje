@@ -148,6 +148,23 @@ class PersonState:
     busy_status_active: bool = False
     deep_sleep_active: bool = False
     telegram_sent: bool = False # Anti-Spam: Bu olay için Telegram mesajı atıldı mı?
+    ear_frames_below: int = 0
+    ear_frames_above: int = 0
+    eyes_closed_now: bool = False
+    goz_oncelik_kilitli: bool = False  # Göz kapalı oturumu bitene kadar hareketsizlik baskılanır
+
+EAR_FRAMES_TO_CLOSE = 2
+EAR_FRAMES_TO_OPEN = 5
+
+
+def goz_oncelikli_mi(state: PersonState) -> bool:
+    """Göz kapalı önceliği: EAR titremesinde bile hareketsizlik devreye girmez."""
+    return (
+        state.goz_oncelik_kilitli
+        or state.eyes_closed_now
+        or state.eye_closed_start_time is not None
+        or state.eye_violation_active
+    )
 
 @dataclass
 class ViolationEpisode:
@@ -230,15 +247,26 @@ class ViolationManager:
             return
         state = self.person_states[track_id]
         state.last_ear = ear
+        state.eyes_closed_now = ear < self.EAR_THRESHOLD
 
         if ear < self.EAR_THRESHOLD:
-            if state.eye_closed_start_time is None:
-                state.eye_closed_start_time = current_time
+            state.ear_frames_below += 1
+            state.ear_frames_above = 0
+            if state.ear_frames_below >= EAR_FRAMES_TO_CLOSE:
+                state.goz_oncelik_kilitli = True
+                if state.eye_closed_start_time is None:
+                    state.eye_closed_start_time = current_time
         else:
-            state.eye_closed_start_time = None
-            state.eye_violation_active = False
-            state.deep_sleep_active = False
-            state.telegram_sent = False # Gözü açtıysa sıfırla
+            state.ear_frames_above += 1
+            state.ear_frames_below = 0
+            if state.ear_frames_above >= EAR_FRAMES_TO_OPEN:
+                state.eye_closed_start_time = None
+                state.eye_violation_active = False
+                state.eyes_closed_now = False
+                state.goz_oncelik_kilitli = False
+                state.still_violation_active = False
+                state.deep_sleep_active = False
+                state.telegram_sent = False
 
     def update_head_state(self, track_id: int, ratio: float, current_time: float):
         if track_id not in self.person_states:
@@ -272,22 +300,44 @@ class ViolationManager:
             eye_rem = self.EYE_CLOSED_SECONDS
             head_rem = 2.0 # Kafa düşmesi için kısa süreli bekleme
 
-            # --- STANDART IHLALLER ---
-            if state.still_start_time is not None:
-                elapsed = current_time - state.still_start_time
-                still_rem = max(0.0, self.STILLNESS_SECONDS - elapsed)
-                if elapsed >= self.STILLNESS_SECONDS:
-                    state.still_violation_active = True
-                    reasons.add("Hareketsizlik")
-                    any_still = True
+            still_violated = False
+            eye_violated = False
+            goz_oncelik = goz_oncelikli_mi(state)
 
             if state.eye_closed_start_time is not None:
                 elapsed = current_time - state.eye_closed_start_time
                 eye_rem = max(0.0, self.EYE_CLOSED_SECONDS - elapsed)
                 if elapsed >= self.EYE_CLOSED_SECONDS:
                     state.eye_violation_active = True
-                    reasons.add("Goz Kapali")
-                    any_eye = True
+                    eye_violated = True
+
+            if state.still_start_time is not None and not goz_oncelik:
+                elapsed = current_time - state.still_start_time
+                still_rem = max(0.0, self.STILLNESS_SECONDS - elapsed)
+                if elapsed >= self.STILLNESS_SECONDS:
+                    state.still_violation_active = True
+                    still_violated = True
+            elif goz_oncelik:
+                state.still_violation_active = False
+
+            if eye_violated:
+                reasons.add("Uyuyor")
+                any_eye = True
+            elif still_violated:
+                reasons.add("Hareketsizlik")
+                any_still = True
+
+            # --- TELEGRAM BİLDİRİM TETİKLEYİCİ (30 SN) ---
+            # Hangi ihlal 30 saniyeyi geçerse geçsin (Uyuyor veya Hareketsizlik)
+            if not state.telegram_sent:
+                current_violation_duration = 0.0
+                if eye_violated:
+                    current_violation_duration = current_time - state.eye_closed_start_time
+                elif still_violated:
+                    current_violation_duration = current_time - state.still_start_time
+                
+                if current_violation_duration >= 30.0:
+                    reasons.add("TELEGRAM_BILDIRIMI_GEREKLI") # Geçici etiket
 
             if state.head_drop_start_time is not None:
                 elapsed = current_time - state.head_drop_start_time
@@ -309,22 +359,36 @@ class ViolationManager:
                     any_deep_sleep = True
                     global_violation = True # Kritik alarm
 
-            # --- MEŞGUL DURUMU (Örn. sadece kafa düşmüş veya sadece göz kapalı + hareketsiz) ---
-            elif (state.head_drop_start_time is not None or state.eye_closed_start_time is not None) and state.still_start_time is not None:
+            # --- MEŞGUL (göz kapalı oturumunda devreye girmez — ses çakışmasını önler) ---
+            elif (
+                not goz_oncelik
+                and state.head_drop_start_time is not None
+                and state.still_start_time is not None
+            ):
                 elapsed_suspicious = current_time - state.still_start_time
                 if elapsed_suspicious >= self.BUSY_THRESHOLD:
                     state.busy_status_active = True
                     reasons.add("Mesgul (Telefonda/Kitapta)")
                     any_busy = True
 
+            still_elapsed = (current_time - state.still_start_time) if state.still_start_time is not None else 0.0
+            eye_elapsed = (current_time - state.eye_closed_start_time) if state.eye_closed_start_time is not None else 0.0
+            head_elapsed = (current_time - state.head_drop_start_time) if state.head_drop_start_time is not None else 0.0
+
             per_person_timers[tid] = {
-                "still": still_rem, 
-                "eye": eye_rem, 
+                "still": still_rem,
+                "eye": eye_rem,
                 "head": head_rem,
+                "still_elapsed": still_elapsed,
+                "eye_elapsed": eye_elapsed,
+                "head_elapsed": head_elapsed,
                 "ear": state.last_ear,
                 "head_ratio": state.last_head_drop_ratio,
+                "still_violation": state.still_violation_active,
+                "eye_violation": state.eye_violation_active,
+                "head_violation": state.head_violation_active,
                 "deep_sleep_active": state.deep_sleep_active,
-                "telegram_sent": state.telegram_sent
+                "telegram_sent": state.telegram_sent,
             }
 
         # Epizod (Bölüm) takibi

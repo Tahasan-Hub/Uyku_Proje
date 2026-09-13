@@ -41,13 +41,18 @@ Bu proje, iş yerlerinde ve güvenlik noktalarında personelin uyku durumunu, g�
    ```
 
 2. **Sistemi Başlatın:**
-   ```bash
-   streamlit run model_karsilastirma_app.py
-   ```
+   * **Seçenek A — Web Dashboard (Streamlit):**
+     ```bash
+     streamlit run model_karsilastirma_app.py
+     ```
+     * **Video Analizi:** Tab 1 üzerinden video yükleyip modelleri karşılaştırın.
+     * **Dashboard:** Tab 2 üzerinden geçmiş verileri grafiklerle inceleyin.
 
-3. **Kullanım:**
-   - **Video Analizi:** Tab 1 üzerinden video yükleyip modelleri seçin.
-   - **Dashboard:** Tab 2 üzerinden geçmiş verileri grafiklerle inceleyin.
+   * **Seçenek B — Doğrudan Canlı Kamera / Video Takip Motoru:**
+     ```bash
+     python uyku_takip.py
+     ```
+     * Webcam veya video üzerinden anlık uyku, göz kapalılığı, kafa düşmesi ve Telegram uyarılarını çalıştırır.
 
 ## ⚙️ Konfigürasyon (`config.json`)
 Eşik değerleri, alarm seslerini ve model yollarını kod değiştirmeden bu dosya üzerinden güncelleyebilirsiniz:
